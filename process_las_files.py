@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
 """
-CloudCompare Batch Processing Script for LAS Files
-===================================================
+CloudCompare + PoissonRecon Batch Processing Script for LAS Files
+=================================================================
 
-This script processes LAS point cloud files through CloudCompare CLI to:
-1. Import LAS files
-2. Compute normals (Triangulation + MST orientation knn=6)
-3. Convert normals to Dip/Dip Direction
-4. Perform Poisson Surface Reconstruction with full parameter control
-5. Save the project as .bin file
+This script processes LAS point cloud files through:
+1. CloudCompare CLI - Import LAS, compute normals, convert to DIP, export PLY
+2. PoissonRecon - Poisson Surface Reconstruction with density scalar field
+3. CloudCompare CLI - Import point cloud and mesh into project for manual
+                      filtering by density SF value
+
+The density scalar field from PoissonRecon allows you to filter out
+low-confidence areas of the reconstruction in CloudCompare by adjusting
+the SF display min value and exporting the filtered mesh.
+
+Prerequisites:
+- CloudCompare (with CLI support)
+- PoissonRecon from https://github.com/mkazhdan/PoissonRecon
 
 Author: CloudCompare Automation Script
 License: MIT
@@ -17,11 +24,21 @@ License: MIT
 import argparse
 import os
 import platform
+import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
+
+
+@dataclass
+class NormalParams:
+    """Parameters for Normal Computation using Octree"""
+
+    radius: str = "AUTO"
+    knn: int = 6
 
 
 @dataclass
@@ -32,30 +49,21 @@ class PoissonParams:
     samples_per_node: float = 1.5
     point_weight: float = 2.0
     threads: int = 16
-    boundary: str = "NEUMANN"  # FREE, DIRICHLET, NEUMANN
-    output_density_as_sf: bool = True
+    boundary_type: int = 3  # 1=Free, 2=Dirichlet, 3=Neumann
+    output_density: bool = True  # Required for filtering in CloudCompare
     interpolate_colors: bool = True
 
 
-@dataclass
-class NormalParams:
-    """Parameters for Normal Computation"""
-
-    local_model: str = "TRI"  # TRI (Triangulation), QUADRIC, PLANE
-    orientation: str = "MST"  # MST, PLUS_Z, MINUS_Z, etc.
-    knn: int = 6  # K-nearest neighbors for MST orientation
-
-
-class CloudCompareProcessor:
+class CloudComparePoissonProcessor:
     """
-    CloudCompare batch processor for LAS files.
+    CloudCompare + PoissonRecon batch processor for LAS files.
 
-    This class handles the automation of CloudCompare CLI operations
-    for processing point cloud data.
+    Processes LAS files and outputs CloudCompare projects (.bin) containing
+    both the point cloud and reconstructed mesh with density scalar field
+    for manual filtering.
     """
 
-    # Common CloudCompare installation paths by platform
-    DEFAULT_PATHS = {
+    CLOUDCOMPARE_PATHS = {
         "Windows": [
             r"C:\Program Files\CloudCompare\CloudCompare.exe",
             r"C:\Program Files (x86)\CloudCompare\CloudCompare.exe",
@@ -68,222 +76,297 @@ class CloudCompareProcessor:
             "/usr/local/bin/cloudcompare",
             "/opt/CloudCompare/CloudCompare",
             "/snap/bin/cloudcompare",
-            os.path.expanduser("~/CloudCompare/CloudCompare"),
         ],
-        "Darwin": [  # macOS
+        "Darwin": [
             "/Applications/CloudCompare.app/Contents/MacOS/CloudCompare",
-            os.path.expanduser(
-                "~/Applications/CloudCompare.app/Contents/MacOS/CloudCompare"
-            ),
+        ],
+    }
+
+    POISSONRECON_PATHS = {
+        "Windows": [
+            r"C:\PoissonRecon\PoissonRecon.exe",
+            r"C:\Program Files\PoissonRecon\PoissonRecon.exe",
+        ],
+        "Linux": [
+            "/usr/local/bin/PoissonRecon",
+            "/usr/bin/PoissonRecon",
+            "/opt/PoissonRecon/PoissonRecon",
+        ],
+        "Darwin": [
+            "/usr/local/bin/PoissonRecon",
         ],
     }
 
     def __init__(
         self,
         cloudcompare_path: Optional[str] = None,
-        poisson_params: Optional[PoissonParams] = None,
+        poissonrecon_path: Optional[str] = None,
         normal_params: Optional[NormalParams] = None,
+        poisson_params: Optional[PoissonParams] = None,
         verbose: bool = True,
     ):
-        """
-        Initialize the CloudCompare processor.
-
-        Args:
-            cloudcompare_path: Path to CloudCompare executable. If None, auto-detect.
-            poisson_params: Parameters for Poisson reconstruction.
-            normal_params: Parameters for normal computation.
-            verbose: Whether to print progress information.
-        """
         self.verbose = verbose
-        self.poisson_params = poisson_params or PoissonParams()
         self.normal_params = normal_params or NormalParams()
-        self.cloudcompare_path = cloudcompare_path or self._find_cloudcompare()
+        self.poisson_params = poisson_params or PoissonParams()
+
+        self.cloudcompare_path = cloudcompare_path or self._find_executable(
+            "CLOUDCOMPARE_PATH", self.CLOUDCOMPARE_PATHS, "CloudCompare"
+        )
+        self.poissonrecon_path = poissonrecon_path or self._find_executable(
+            "POISSONRECON_PATH", self.POISSONRECON_PATHS, "PoissonRecon"
+        )
 
         if not self.cloudcompare_path:
             raise RuntimeError(
                 "CloudCompare not found! Please install CloudCompare or "
                 "set the CLOUDCOMPARE_PATH environment variable."
             )
+        if not self.poissonrecon_path:
+            raise RuntimeError(
+                "PoissonRecon not found! Please install PoissonRecon from "
+                "https://github.com/mkazhdan/PoissonRecon or "
+                "set the POISSONRECON_PATH environment variable."
+            )
 
         self._log(f"Using CloudCompare: {self.cloudcompare_path}")
+        self._log(f"Using PoissonRecon: {self.poissonrecon_path}")
 
     def _log(self, message: str, level: str = "INFO"):
-        """Print log message if verbose mode is enabled."""
         if self.verbose:
             print(f"[{level}] {message}")
 
-    def _find_cloudcompare(self) -> Optional[str]:
-        """Auto-detect CloudCompare installation path."""
-        # First check environment variable
-        env_path = os.environ.get("CLOUDCOMPARE_PATH")
+    def _find_executable(
+        self, env_var: str, paths_dict: dict, name: str
+    ) -> Optional[str]:
+        """Find executable from environment variable or common paths."""
+        env_path = os.environ.get(env_var)
         if env_path and os.path.isfile(env_path):
             return env_path
 
-        # Check platform-specific default paths
         system = platform.system()
-        paths = self.DEFAULT_PATHS.get(system, [])
+        paths = paths_dict.get(system, [])
 
         for path in paths:
-            if os.path.isfile(path):
-                return path
+            expanded = os.path.expanduser(path)
+            if os.path.isfile(expanded):
+                return expanded
 
         # Try to find in PATH
-        try:
-            result = subprocess.run(
-                ["which", "CloudCompare"]
-                if system != "Windows"
-                else ["where", "CloudCompare"],
-                capture_output=True,
-                text=True,
-            )
-            if result.returncode == 0:
-                return result.stdout.strip().split("\n")[0]
-        except Exception:
-            pass
+        result = shutil.which(name)
+        if result:
+            return result
+
+        # Try lowercase on Linux
+        if system == "Linux":
+            result = shutil.which(name.lower())
+            if result:
+                return result
 
         return None
 
-    def _build_command(self, input_file: Path, output_file: Path) -> List[str]:
-        """
-        Build the CloudCompare CLI command with all parameters.
+    def _run_command(
+        self, cmd: List[str], description: str, timeout: int = 3600
+    ) -> Tuple[bool, str]:
+        """Run a command and return success status and output."""
+        self._log(f"Running: {' '.join(cmd)}")
 
-        Args:
-            input_file: Path to input LAS file.
-            output_file: Path for output .bin file.
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
 
-        Returns:
-            List of command arguments.
-        """
+            output = result.stdout + result.stderr
+
+            if result.returncode == 0:
+                return True, output
+            else:
+                self._log(
+                    f"{description} failed with exit code {result.returncode}", "ERROR"
+                )
+                if output:
+                    self._log(f"Output: {output}", "ERROR")
+                return False, output
+
+        except subprocess.TimeoutExpired:
+            self._log(f"{description} timed out after {timeout}s", "ERROR")
+            return False, "Timeout"
+        except Exception as e:
+            self._log(f"{description} failed with exception: {e}", "ERROR")
+            return False, str(e)
+
+    def _step1_compute_normals(self, input_las: Path, output_ply: Path) -> bool:
+        """Step 1: CloudCompare - Load LAS, compute normals, convert to DIP, export PLY."""
+        self._log("")
+        self._log(
+            "Step 1: Computing normals and converting to DIP with CloudCompare..."
+        )
+        self._log(f"  - Octree Radius: {self.normal_params.radius}")
+        self._log(f"  - MST Orientation KNN: {self.normal_params.knn}")
+
         cmd = [
             self.cloudcompare_path,
             "-SILENT",
             "-AUTO_SAVE",
             "OFF",
             "-O",
-            str(input_file),
+            str(input_las),
+            "-OCTREE_NORMALS",
+            str(self.normal_params.radius),
+            "-ORIENT_NORMS_MST",
+            str(self.normal_params.knn),
+            "-NORMALS_TO_DIP",
+            "-C_EXPORT_FMT",
+            "PLY",
+            "-PLY_EXPORT_FMT",
+            "ASCII",
+            "-SAVE_CLOUDS",
+            "FILE",
+            str(output_ply),
         ]
 
-        # Compute Normals
-        # CloudCompare CLI syntax: -COMPUTE_NORMALS [LOCAL_MODEL] [RADIUS]
-        # For MST orientation: -ORIENT_NORMS_MST [K]
-        cmd.extend(["-COMPUTE_NORMALS"])
+        success, _ = self._run_command(cmd, "Normal computation")
 
-        # Set local model for normal computation (if supported by CC version)
-        # Some versions use: -COMPUTE_NORMALS LOCAL_MODEL radius
-        # Triangulation is typically the default
+        if success and output_ply.exists():
+            self._log("Generated PLY with normals", "SUCCESS")
+            return True
+        else:
+            self._log(f"Failed to generate PLY with normals: {output_ply}", "ERROR")
+            return False
 
-        # Apply MST orientation with specified knn
-        # Note: Some CC versions support -ORIENT_NORMS_MST K
-        cmd.extend(["-ORIENT_NORMS_MST", str(self.normal_params.knn)])
+    def _step2_poisson_reconstruction(self, input_ply: Path, output_mesh: Path) -> bool:
+        """Step 2: PoissonRecon - Poisson Surface Reconstruction with density SF."""
+        self._log("")
+        self._log("Step 2: Running Poisson Surface Reconstruction...")
+        self._log(f"  - Octree depth: {self.poisson_params.octree_depth}")
+        self._log(f"  - Samples per node: {self.poisson_params.samples_per_node}")
+        self._log(f"  - Point weight: {self.poisson_params.point_weight}")
+        self._log(f"  - Boundary type: {self.poisson_params.boundary_type} (Neumann)")
+        self._log(f"  - Threads: {self.poisson_params.threads}")
+        self._log(f"  - Output density as SF: YES (for filtering in CloudCompare)")
 
-        # Convert Normals to Dip/Dip Direction
-        cmd.extend(["-NORMALS_TO_DIP"])
-
-        # Poisson Surface Reconstruction
-        # CloudCompare CLI syntax varies by version:
-        # Older: -POISSON depth samples_per_node boundary
-        # Newer: -POISSON with more options
-
-        # Build Poisson command with available parameters
-        poisson_cmd = [
-            "-POISSON",
+        cmd = [
+            self.poissonrecon_path,
+            "--in",
+            str(input_ply),
+            "--out",
+            str(output_mesh),
+            "--depth",
             str(self.poisson_params.octree_depth),
+            "--samplesPerNode",
+            str(self.poisson_params.samples_per_node),
+            "--pointWeight",
+            str(self.poisson_params.point_weight),
+            "--bType",
+            str(self.poisson_params.boundary_type),
+            "--threads",
+            str(self.poisson_params.threads),
         ]
 
-        # Add samples per node if supported
-        poisson_cmd.append(str(self.poisson_params.samples_per_node))
+        # Always output density for filtering in CloudCompare
+        if self.poisson_params.output_density:
+            cmd.append("--density")
 
-        # Add boundary condition
-        poisson_cmd.append(self.poisson_params.boundary)
+        if self.poisson_params.interpolate_colors:
+            cmd.append("--colors")
 
-        cmd.extend(poisson_cmd)
+        success, _ = self._run_command(cmd, "Poisson reconstruction")
 
-        # Note: The following Poisson parameters may require GUI or newer CLI versions:
-        # - output_density_as_sf
-        # - interpolate_colors
-        # - point_weight
-        # - threads
-        # These are logged for reference but may not be available in all CLI versions
+        if success and output_mesh.exists():
+            self._log("Generated mesh with density scalar field", "SUCCESS")
+            return True
+        else:
+            self._log(f"Failed to generate mesh: {output_mesh}", "ERROR")
+            return False
 
-        # Set export format to BIN (CloudCompare native format)
-        cmd.extend(["-C_EXPORT_FMT", "BIN"])
-        cmd.extend(["-M_EXPORT_FMT", "BIN"])
+    def _step3_create_project(
+        self, input_ply: Path, input_mesh: Path, output_bin: Path
+    ) -> bool:
+        """Step 3: CloudCompare - Import point cloud and mesh, save as .bin project."""
+        self._log("")
+        self._log(
+            "Step 3: Creating CloudCompare project (.bin) for manual filtering..."
+        )
+        self._log("  The mesh contains a 'Density' scalar field from PoissonRecon.")
+        self._log("  In CloudCompare, you can:")
+        self._log("    1. Select the mesh")
+        self._log(
+            "    2. Display the Density SF (Edit > Scalar Fields > Set Active SF)"
+        )
+        self._log("    3. Adjust SF display range to visualize low-density areas")
+        self._log("    4. Filter by SF value (Edit > Scalar Fields > Filter by Value)")
+        self._log("    5. Export the filtered mesh")
 
-        # Save the cloud and mesh
-        # Using FILE option to specify exact output path
-        cmd.extend(["-SAVE_CLOUDS", "FILE", str(output_file)])
+        cmd = [
+            self.cloudcompare_path,
+            "-SILENT",
+            "-AUTO_SAVE",
+            "OFF",
+            "-O",
+            str(input_ply),
+            "-O",
+            str(input_mesh),
+            "-SAVE_CLOUDS",
+            "ALL",
+            "FILE",
+            str(output_bin),
+        ]
 
-        # Also save the mesh with a similar name
-        mesh_output = output_file.parent / f"{output_file.stem}_mesh.bin"
-        cmd.extend(["-SAVE_MESHES", "FILE", str(mesh_output)])
+        success, _ = self._run_command(cmd, "Project creation")
 
-        return cmd
+        if success and output_bin.exists():
+            self._log(f"Created CloudCompare project: {output_bin}", "SUCCESS")
+            return True
+        else:
+            self._log(f"Failed to create project: {output_bin}", "ERROR")
+            return False
 
-    def process_file(self, input_file: Path, output_dir: Path) -> bool:
-        """
-        Process a single LAS file.
-
-        Args:
-            input_file: Path to input LAS file.
-            output_dir: Directory for output files.
-
-        Returns:
-            True if processing succeeded, False otherwise.
-        """
+    def process_file(self, input_file: Path, output_dir: Path, temp_dir: Path) -> bool:
+        """Process a single LAS file through the complete pipeline."""
         filename = input_file.stem
-        output_file = output_dir / f"{filename}.bin"
+
+        # Define paths
+        ply_with_normals = temp_dir / f"{filename}_normals.ply"
+        mesh_ply = temp_dir / f"{filename}_mesh.ply"
+        output_bin = output_dir / f"{filename}.bin"
 
         self._log("=" * 70)
         self._log(f"Processing: {filename}")
         self._log(f"Input:  {input_file}")
-        self._log(f"Output: {output_file}")
+        self._log(f"Output: {output_bin}")
 
-        # Build command
-        cmd = self._build_command(input_file, output_file)
-
-        self._log(f"Command: {' '.join(cmd)}")
-
-        try:
-            # Execute CloudCompare
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=3600,  # 1 hour timeout per file
-            )
-
-            if result.returncode == 0:
-                self._log(f"Successfully processed: {filename}", "SUCCESS")
-                if result.stdout:
-                    self._log(f"Output: {result.stdout}")
-                return True
-            else:
-                self._log(f"Failed to process: {filename}", "ERROR")
-                self._log(f"Exit code: {result.returncode}", "ERROR")
-                if result.stderr:
-                    self._log(f"Error: {result.stderr}", "ERROR")
-                return False
-
-        except subprocess.TimeoutExpired:
-            self._log(f"Timeout processing: {filename}", "ERROR")
+        # Step 1: Compute normals and export PLY
+        if not self._step1_compute_normals(input_file, ply_with_normals):
             return False
-        except Exception as e:
-            self._log(f"Exception processing {filename}: {e}", "ERROR")
+
+        # Step 2: Poisson Surface Reconstruction with density SF
+        if not self._step2_poisson_reconstruction(ply_with_normals, mesh_ply):
             return False
+
+        # Step 3: Create CloudCompare project for manual filtering
+        if not self._step3_create_project(ply_with_normals, mesh_ply, output_bin):
+            return False
+
+        self._log("")
+        self._log(f"Successfully processed: {filename}", "SUCCESS")
+        self._log("")
+        self._log("Next steps in CloudCompare GUI:")
+        self._log(f"  1. Open {output_bin}")
+        self._log("  2. Select the mesh in DB Tree")
+        self._log("  3. Properties panel > SF Display > adjust 'displayed' min value")
+        self._log(
+            "  4. Use 'Edit > Scalar Fields > Filter by Value' to remove low-density vertices"
+        )
+        self._log("  5. Export filtered mesh via 'File > Save'")
+
+        return True
 
     def process_directory(
         self, input_dir: Path, output_subdir: str = "Processed"
     ) -> dict:
-        """
-        Process all LAS files in a directory.
-
-        Args:
-            input_dir: Directory containing LAS files.
-            output_subdir: Subdirectory name for output files.
-
-        Returns:
-            Dictionary with processing statistics.
-        """
+        """Process all LAS files in a directory."""
         input_dir = Path(input_dir).resolve()
         output_dir = input_dir / output_subdir
 
@@ -291,16 +374,14 @@ class CloudCompareProcessor:
         output_dir.mkdir(parents=True, exist_ok=True)
 
         self._log("=" * 70)
-        self._log("CloudCompare Batch Processing")
+        self._log("CloudCompare + PoissonRecon Batch Processing")
         self._log("=" * 70)
         self._log(f"Input directory:  {input_dir}")
         self._log(f"Output directory: {output_dir}")
 
-        # Find all LAS files (case-insensitive)
+        # Find all LAS files
         las_files = list(input_dir.glob("*.las")) + list(input_dir.glob("*.LAS"))
-        las_files = list(
-            set(las_files)
-        )  # Remove duplicates on case-insensitive systems
+        las_files = list(set(las_files))
         las_files.sort()
 
         if not las_files:
@@ -309,39 +390,38 @@ class CloudCompareProcessor:
 
         self._log(f"Found {len(las_files)} LAS file(s) to process")
 
-        # Log processing parameters
+        # Log parameters
         self._log("-" * 70)
         self._log("Processing Parameters:")
-        self._log(f"  Normal Computation:")
-        self._log(
-            f"    - Local Model: {self.normal_params.local_model} (Triangulation)"
-        )
-        self._log(
-            f"    - Orientation: {self.normal_params.orientation} (knn={self.normal_params.knn})"
-        )
-        self._log(f"  Poisson Reconstruction:")
+        self._log("  Normal Computation:")
+        self._log(f"    - Octree Radius: {self.normal_params.radius}")
+        self._log(f"    - MST Orientation KNN: {self.normal_params.knn}")
+        self._log("  Poisson Reconstruction:")
         self._log(f"    - Octree Depth: {self.poisson_params.octree_depth}")
         self._log(f"    - Samples per Node: {self.poisson_params.samples_per_node}")
         self._log(f"    - Point Weight: {self.poisson_params.point_weight}")
-        self._log(f"    - Boundary: {self.poisson_params.boundary}")
+        self._log(f"    - Boundary: Neumann ({self.poisson_params.boundary_type})")
         self._log(f"    - Threads: {self.poisson_params.threads}")
-        self._log(
-            f"    - Output Density as SF: {self.poisson_params.output_density_as_sf}"
-        )
+        self._log(f"    - Output Density as SF: YES")
         self._log(f"    - Interpolate Colors: {self.poisson_params.interpolate_colors}")
         self._log("-" * 70)
 
-        # Process files
-        success_count = 0
-        failed_count = 0
+        # Create temporary directory
+        with tempfile.TemporaryDirectory(prefix="cc_poisson_") as temp_dir:
+            temp_path = Path(temp_dir)
+            self._log(f"Temporary directory: {temp_path}")
 
-        for i, las_file in enumerate(las_files, 1):
-            self._log(f"\nFile {i}/{len(las_files)}")
+            # Process files
+            success_count = 0
+            failed_count = 0
 
-            if self.process_file(las_file, output_dir):
-                success_count += 1
-            else:
-                failed_count += 1
+            for i, las_file in enumerate(las_files, 1):
+                self._log(f"\nFile {i}/{len(las_files)}")
+
+                if self.process_file(las_file, output_dir, temp_path):
+                    success_count += 1
+                else:
+                    failed_count += 1
 
         # Summary
         self._log("\n" + "=" * 70)
@@ -350,6 +430,15 @@ class CloudCompareProcessor:
         self._log(f"Total files:      {len(las_files)}")
         self._log(f"Successful:       {success_count}")
         self._log(f"Failed:           {failed_count}")
+        self._log("")
+        self._log(f"Output files are in: {output_dir}")
+        self._log("  - [filename].bin : CloudCompare project with point cloud and mesh")
+        self._log("")
+        self._log("The mesh includes a 'Density' scalar field from PoissonRecon.")
+        self._log("Open the .bin file in CloudCompare to filter out low-density areas:")
+        self._log("  1. Select mesh > Properties > SF Display > adjust min value")
+        self._log("  2. Edit > Scalar Fields > Filter by Value")
+        self._log("  3. Export the filtered mesh")
 
         return {
             "total": len(las_files),
@@ -358,63 +447,35 @@ class CloudCompareProcessor:
         }
 
 
-def create_alternative_script(input_dir: Path, output_dir: Path) -> str:
-    """
-    Generate a CloudCompare script file for GUI-based batch processing.
-
-    This is useful when CLI doesn't support all needed parameters,
-    allowing users to run the script through CloudCompare's GUI.
-
-    Args:
-        input_dir: Directory containing LAS files.
-        output_dir: Directory for output files.
-
-    Returns:
-        Path to generated script file.
-    """
-    script_content = """# CloudCompare Batch Processing Script
-# Run this through CloudCompare GUI: Tools > Batch Processing
-# Or use: CloudCompare -SCRIPT this_file.txt
-
-# Note: This script template shows the operations that would be performed.
-# Actual GUI-based batch processing may require manual steps for some parameters.
-
-# For each LAS file:
-# 1. Open file
-# 2. Compute Normals
-#    - Local surface model: Triangulation
-#    - Orientation: Minimum Spanning Tree (knn=6)
-# 3. Convert Normals to Dip/Dip Direction
-# 4. Poisson Surface Reconstruction
-#    - Octree depth: 11
-#    - Samples per node: 1.5
-#    - Point weight: 2.0
-#    - Threads: 16
-#    - Boundary: Neumann
-#    - Output density as SF: Yes
-#    - Interpolate colors: Yes
-# 5. Save as .bin file
-"""
-
-    script_path = output_dir / "cloudcompare_batch_script.txt"
-    script_path.write_text(script_content)
-    return str(script_path)
-
-
 def main():
-    """Main entry point for the script."""
+    """Main entry point."""
     parser = argparse.ArgumentParser(
-        description="Batch process LAS files with CloudCompare",
+        description="Batch process LAS files with CloudCompare and PoissonRecon",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   %(prog)s /path/to/las/files
   %(prog)s . --output-dir Processed
   %(prog)s /data --octree-depth 12 --threads 8
-  CLOUDCOMPARE_PATH=/custom/path/CloudCompare %(prog)s /data
 
 Environment Variables:
   CLOUDCOMPARE_PATH    Path to CloudCompare executable
+  POISSONRECON_PATH    Path to PoissonRecon executable
+
+Prerequisites:
+  - CloudCompare: https://www.cloudcompare.org/
+  - PoissonRecon: https://github.com/mkazhdan/PoissonRecon
+
+Output:
+  The script creates CloudCompare project files (.bin) containing:
+  - Point cloud with computed normals and DIP values
+  - Reconstructed mesh with density scalar field
+
+  The density SF allows manual filtering in CloudCompare:
+  1. Open .bin file in CloudCompare
+  2. Select mesh > Properties > SF Display > adjust min value
+  3. Edit > Scalar Fields > Filter by Value
+  4. Export the filtered mesh
         """,
     )
 
@@ -438,6 +499,28 @@ Environment Variables:
         type=str,
         default=None,
         help="Path to CloudCompare executable",
+    )
+
+    parser.add_argument(
+        "--poissonrecon-path",
+        type=str,
+        default=None,
+        help="Path to PoissonRecon executable",
+    )
+
+    # Normal computation parameters
+    parser.add_argument(
+        "--radius",
+        type=str,
+        default="AUTO",
+        help="Radius for octree normal computation (default: AUTO)",
+    )
+
+    parser.add_argument(
+        "--knn",
+        type=int,
+        default=6,
+        help="K-nearest neighbors for MST normal orientation (default: 6)",
     )
 
     # Poisson parameters
@@ -470,47 +553,53 @@ Environment Variables:
     )
 
     parser.add_argument(
-        "--boundary",
-        type=str,
-        choices=["FREE", "DIRICHLET", "NEUMANN"],
-        default="NEUMANN",
-        help="Boundary condition for Poisson reconstruction (default: NEUMANN)",
-    )
-
-    # Normal parameters
-    parser.add_argument(
-        "--knn",
+        "--boundary-type",
         type=int,
-        default=6,
-        help="K-nearest neighbors for MST normal orientation (default: 6)",
+        choices=[1, 2, 3],
+        default=3,
+        help="Boundary type: 1=Free, 2=Dirichlet, 3=Neumann (default: 3)",
     )
 
-    parser.add_argument("--quiet", action="store_true", help="Suppress progress output")
+    parser.add_argument(
+        "--no-colors",
+        action="store_true",
+        help="Disable color interpolation in Poisson reconstruction",
+    )
+
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress progress output",
+    )
 
     args = parser.parse_args()
 
     # Create parameter objects
+    normal_params = NormalParams(
+        radius=args.radius,
+        knn=args.knn,
+    )
+
     poisson_params = PoissonParams(
         octree_depth=args.octree_depth,
         samples_per_node=args.samples_per_node,
         point_weight=args.point_weight,
         threads=args.threads,
-        boundary=args.boundary,
+        boundary_type=args.boundary_type,
+        output_density=True,  # Always enable for filtering workflow
+        interpolate_colors=not args.no_colors,
     )
 
-    normal_params = NormalParams(knn=args.knn)
-
     try:
-        processor = CloudCompareProcessor(
+        processor = CloudComparePoissonProcessor(
             cloudcompare_path=args.cloudcompare_path,
-            poisson_params=poisson_params,
+            poissonrecon_path=args.poissonrecon_path,
             normal_params=normal_params,
+            poisson_params=poisson_params,
             verbose=not args.quiet,
         )
 
         result = processor.process_directory(Path(args.input_dir), args.output_dir)
-
-        # Exit with error code if any files failed
         sys.exit(result["failed"])
 
     except RuntimeError as e:

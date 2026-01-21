@@ -1,28 +1,40 @@
 #!/bin/bash
 
 # ============================================================================
-# CloudCompare Batch Processing Script for LAS Files
+# CloudCompare + PoissonRecon Batch Processing Script for LAS Files
 # ============================================================================
-# This script processes LAS point cloud files through CloudCompare CLI to:
-# 1. Import LAS files
-# 2. Compute normals (Triangulation + MST orientation knn=6)
-# 3. Convert normals to Dip/Dip Direction
-# 4. Perform Poisson Surface Reconstruction
-# 5. Save the project as .bin file
+# This script processes LAS point cloud files through:
+# 1. CloudCompare CLI - Import LAS, compute normals, convert to DIP, export PLY
+# 2. PoissonRecon - Poisson Surface Reconstruction with density scalar field
+# 3. CloudCompare CLI - Import point cloud and mesh into project for manual
+#                       filtering by density SF value
+#
+# The density scalar field from PoissonRecon allows you to filter out
+# low-confidence areas of the reconstruction in CloudCompare by adjusting
+# the SF display min value and exporting the filtered mesh.
+#
+# Prerequisites:
+# - CloudCompare (with CLI support)
+# - PoissonRecon from https://github.com/mkazhdan/PoissonRecon
+#
+# Poisson Surface Reconstruction Parameters:
+# - Octree depth = 11
+# - Boundary = Neumann
+# - Samples per node = 1.5
+# - Point weight = 2.0
+# - Threads = 16
+# - Output density as SF = Yes (for manual filtering in CloudCompare)
 # ============================================================================
+
+set -e  # Exit on error
 
 # Configuration
 # ----------------------------------------------------------------------------
-# Path to CloudCompare executable (adjust based on your installation)
-# Linux typical paths:
-#   - /usr/bin/CloudCompare
-#   - /usr/bin/cloudcompare
-#   - /opt/CloudCompare/CloudCompare
-#   - ~/CloudCompare/CloudCompare
-# macOS typical path:
-#   - /Applications/CloudCompare.app/Contents/MacOS/CloudCompare
-
+# Path to CloudCompare executable
 CLOUDCOMPARE_PATH="${CLOUDCOMPARE_PATH:-CloudCompare}"
+
+# Path to PoissonRecon executable
+POISSONRECON_PATH="${POISSONRECON_PATH:-PoissonRecon}"
 
 # Input directory containing LAS files
 INPUT_DIR="${1:-.}"
@@ -30,15 +42,19 @@ INPUT_DIR="${1:-.}"
 # Output directory for processed files (relative to input)
 OUTPUT_DIR="Processed"
 
+# Temporary directory for intermediate files
+TEMP_DIR=""
+
+# Normal Computation Parameters
+OCTREE_RADIUS="AUTO"
+KNN=6
+
 # Poisson Reconstruction Parameters
 OCTREE_DEPTH=11
 SAMPLES_PER_NODE=1.5
 POINT_WEIGHT=2.0
 THREADS=16
-BOUNDARY="NEUMANN"
-
-# Normal Computation Parameters
-KNN=6
+BOUNDARY_TYPE=3  # 1=Free, 2=Dirichlet, 3=Neumann
 
 # ============================================================================
 # Helper Functions
@@ -63,14 +79,27 @@ print_success() {
     echo "[SUCCESS] $1"
 }
 
+print_warning() {
+    echo "[WARNING] $1"
+}
+
+cleanup() {
+    if [ -n "$TEMP_DIR" ] && [ -d "$TEMP_DIR" ]; then
+        print_info "Cleaning up temporary files..."
+        rm -rf "$TEMP_DIR"
+    fi
+}
+
+trap cleanup EXIT
+
 check_cloudcompare() {
     if ! command -v "$CLOUDCOMPARE_PATH" &> /dev/null; then
-        # Try common alternative paths
         local alternatives=(
             "cloudcompare"
             "CloudCompare"
             "/usr/bin/CloudCompare"
             "/usr/bin/cloudcompare"
+            "/usr/local/bin/CloudCompare"
             "/opt/CloudCompare/CloudCompare"
             "/snap/bin/cloudcompare"
             "/Applications/CloudCompare.app/Contents/MacOS/CloudCompare"
@@ -86,115 +115,137 @@ check_cloudcompare() {
 
         print_error "CloudCompare not found!"
         print_error "Please set CLOUDCOMPARE_PATH environment variable or install CloudCompare."
-        print_error "Example: export CLOUDCOMPARE_PATH=/path/to/CloudCompare"
         exit 1
     fi
     print_info "Using CloudCompare: $CLOUDCOMPARE_PATH"
 }
 
+check_poissonrecon() {
+    if ! command -v "$POISSONRECON_PATH" &> /dev/null; then
+        local alternatives=(
+            "PoissonRecon"
+            "poissonrecon"
+            "/usr/local/bin/PoissonRecon"
+            "/usr/bin/PoissonRecon"
+            "/opt/PoissonRecon/PoissonRecon"
+        )
+
+        for alt in "${alternatives[@]}"; do
+            if command -v "$alt" &> /dev/null || [ -x "$alt" ]; then
+                POISSONRECON_PATH="$alt"
+                print_info "Found PoissonRecon at: $POISSONRECON_PATH"
+                return 0
+            fi
+        done
+
+        print_error "PoissonRecon not found!"
+        print_error "Please install PoissonRecon from https://github.com/mkazhdan/PoissonRecon"
+        print_error "Or set POISSONRECON_PATH environment variable."
+        exit 1
+    fi
+    print_info "Using PoissonRecon: $POISSONRECON_PATH"
+}
+
 # ============================================================================
-# Main Processing Function
+# Processing Functions
 # ============================================================================
 
 process_las_file() {
     local input_file="$1"
     local filename=$(basename "$input_file" .las)
-    filename=$(basename "$filename" .LAS)  # Handle uppercase extension
-    local output_file="${OUTPUT_DIR}/${filename}.bin"
+    filename=$(basename "$filename" .LAS)
+
+    local ply_with_normals="${TEMP_DIR}/${filename}_normals.ply"
+    local mesh_ply="${TEMP_DIR}/${filename}_mesh.ply"
+    local output_bin="${OUTPUT_DIR}/${filename}.bin"
 
     print_header "Processing: $filename"
     print_info "Input:  $input_file"
-    print_info "Output: $output_file"
+    print_info "Output: $output_bin"
 
-    # CloudCompare CLI command
-    # Note: CloudCompare CLI processes commands in sequence
-    #
-    # Command breakdown:
-    # -SILENT              : Suppress GUI dialogs
-    # -O                   : Open/load file
-    # -COMPUTE_NORMALS     : Compute normals for the point cloud
-    # -NORMALS_TO_DIP      : Convert normals to Dip/Dip Direction
-    # -POISSON             : Poisson Surface Reconstruction
-    # -C_EXPORT_FMT BIN    : Set cloud export format to BIN
-    # -M_EXPORT_FMT BIN    : Set mesh export format to BIN
-    # -SAVE_CLOUDS         : Save point clouds
-    # -SAVE_MESHES         : Save meshes
+    # -------------------------------------------------------------------------
+    # Step 1: CloudCompare - Load LAS, compute normals, convert to DIP, export PLY
+    # -------------------------------------------------------------------------
+    print_info ""
+    print_info "Step 1: Computing normals and converting to DIP with CloudCompare..."
+    print_info "  - Octree Radius: $OCTREE_RADIUS"
+    print_info "  - MST Orientation KNN: $KNN"
 
-    # Build the command
-    # Note: Some parameters may need adjustment based on CloudCompare version
-    local cmd=(
-        "$CLOUDCOMPARE_PATH"
-        -SILENT
-        -AUTO_SAVE OFF
-        -O "$input_file"
-
-        # Compute Normals
-        # LOCAL_MODEL: TRI (Triangulation), QUADRIC, or PLANE
-        # ORIENT: PLUS_ZERO, MINUS_ZERO, PLUS_BARYCENTER, MINUS_BARYCENTER,
-        #         PLUS_X, MINUS_X, PLUS_Y, MINUS_Y, PLUS_Z, MINUS_Z,
-        #         PREVIOUS, or MST with neighbor count
-        -COMPUTE_NORMALS
-
-        # Convert Normals to Dip/Dip Direction
-        -NORMALS_TO_DIP
-
-        # Poisson Surface Reconstruction
-        # Parameters: OCTREE_DEPTH SAMPLES_PER_NODE BOUNDARY
-        # Boundary types: FREE, DIRICHLET, NEUMANN
-        -POISSON "$OCTREE_DEPTH" "$SAMPLES_PER_NODE" "$BOUNDARY"
-
-        # Set export formats
-        -C_EXPORT_FMT BIN
-        -M_EXPORT_FMT BIN
-
-        # Save outputs to the processed directory
-        -SAVE_CLOUDS FILE "$output_file"
-    )
-
-    print_info "Executing CloudCompare CLI..."
-    print_info "Command: ${cmd[*]}"
-    echo ""
-
-    # Execute the command
-    if "${cmd[@]}"; then
-        print_success "Successfully processed: $filename"
-        return 0
-    else
-        print_error "Failed to process: $filename"
-        return 1
-    fi
-}
-
-# Alternative processing using a more compatible approach
-# Some CloudCompare versions have different CLI syntax
-process_las_file_alternative() {
-    local input_file="$1"
-    local filename=$(basename "$input_file" .las)
-    filename=$(basename "$filename" .LAS)
-    local output_file="${OUTPUT_DIR}/${filename}.bin"
-
-    print_header "Processing: $filename (Alternative Method)"
-    print_info "Input:  $input_file"
-    print_info "Output: $output_file"
-
-    # This is a more verbose command that may work better with some versions
     "$CLOUDCOMPARE_PATH" -SILENT -AUTO_SAVE OFF \
         -O "$input_file" \
-        -COMPUTE_NORMALS \
+        -OCTREE_NORMALS "$OCTREE_RADIUS" \
+        -ORIENT_NORMS_MST "$KNN" \
         -NORMALS_TO_DIP \
-        -POISSON "$OCTREE_DEPTH" \
-        -C_EXPORT_FMT BIN \
-        -SAVE_CLOUDS FILE "$output_file"
+        -C_EXPORT_FMT PLY -PLY_EXPORT_FMT ASCII \
+        -SAVE_CLOUDS FILE "$ply_with_normals"
 
-    local exit_code=$?
-
-    if [ $exit_code -eq 0 ]; then
-        print_success "Successfully processed: $filename"
-    else
-        print_error "Failed to process: $filename (exit code: $exit_code)"
+    if [ ! -f "$ply_with_normals" ]; then
+        print_error "Failed to generate PLY with normals: $ply_with_normals"
+        return 1
     fi
+    print_success "Generated PLY with normals"
 
-    return $exit_code
+    # -------------------------------------------------------------------------
+    # Step 2: PoissonRecon - Poisson Surface Reconstruction with density SF
+    # -------------------------------------------------------------------------
+    print_info ""
+    print_info "Step 2: Running Poisson Surface Reconstruction..."
+    print_info "  - Octree depth: $OCTREE_DEPTH"
+    print_info "  - Samples per node: $SAMPLES_PER_NODE"
+    print_info "  - Point weight: $POINT_WEIGHT"
+    print_info "  - Boundary type: $BOUNDARY_TYPE (Neumann)"
+    print_info "  - Threads: $THREADS"
+    print_info "  - Output density as SF: YES (for filtering in CloudCompare)"
+
+    "$POISSONRECON_PATH" \
+        --in "$ply_with_normals" \
+        --out "$mesh_ply" \
+        --depth "$OCTREE_DEPTH" \
+        --samplesPerNode "$SAMPLES_PER_NODE" \
+        --pointWeight "$POINT_WEIGHT" \
+        --bType "$BOUNDARY_TYPE" \
+        --threads "$THREADS" \
+        --density \
+        --colors
+
+    if [ ! -f "$mesh_ply" ]; then
+        print_error "Failed to generate mesh: $mesh_ply"
+        return 1
+    fi
+    print_success "Generated mesh with density scalar field"
+
+    # -------------------------------------------------------------------------
+    # Step 3: CloudCompare - Import point cloud and mesh, save as .bin project
+    # -------------------------------------------------------------------------
+    print_info ""
+    print_info "Step 3: Creating CloudCompare project (.bin) for manual filtering..."
+    print_info "  The mesh contains a 'Density' scalar field from PoissonRecon."
+    print_info "  In CloudCompare, you can:"
+    print_info "    1. Select the mesh"
+    print_info "    2. Display the Density SF (Edit > Scalar Fields > Set Active SF)"
+    print_info "    3. Adjust SF display range to visualize low-density areas"
+    print_info "    4. Filter by SF value (Edit > Scalar Fields > Filter by Value)"
+    print_info "    5. Export the filtered mesh"
+
+    "$CLOUDCOMPARE_PATH" -SILENT -AUTO_SAVE OFF \
+        -O "$ply_with_normals" \
+        -O "$mesh_ply" \
+        -SAVE_CLOUDS ALL FILE "$output_bin"
+
+    if [ -f "$output_bin" ]; then
+        print_success "Created CloudCompare project: $output_bin"
+        print_info ""
+        print_info "Next steps in CloudCompare GUI:"
+        print_info "  1. Open $output_bin"
+        print_info "  2. Select the mesh in DB Tree"
+        print_info "  3. Properties panel > SF Display > adjust 'displayed' min value"
+        print_info "  4. Use 'Edit > Scalar Fields > Filter by Value' to remove low-density vertices"
+        print_info "  5. Export filtered mesh via 'File > Save'"
+        return 0
+    else
+        print_error "Failed to create project: $output_bin"
+        return 1
+    fi
 }
 
 # ============================================================================
@@ -202,10 +253,11 @@ process_las_file_alternative() {
 # ============================================================================
 
 main() {
-    print_header "CloudCompare Batch Processing Script"
+    print_header "CloudCompare + PoissonRecon Batch Processing Script"
 
-    # Check if CloudCompare is available
+    # Check dependencies
     check_cloudcompare
+    check_poissonrecon
 
     # Validate input directory
     if [ ! -d "$INPUT_DIR" ]; then
@@ -221,6 +273,10 @@ main() {
     mkdir -p "$OUTPUT_DIR"
     print_info "Output directory: $OUTPUT_DIR"
 
+    # Create temporary directory
+    TEMP_DIR=$(mktemp -d)
+    print_info "Temporary directory: $TEMP_DIR"
+
     # Find all LAS files
     shopt -s nullglob nocaseglob
     las_files=(*.las *.LAS)
@@ -232,9 +288,22 @@ main() {
     fi
 
     print_info "Found ${#las_files[@]} LAS file(s) to process"
+    print_info ""
+    print_info "Processing Parameters:"
+    print_info "  Normal Computation:"
+    print_info "    - Octree Radius: $OCTREE_RADIUS"
+    print_info "    - MST Orientation KNN: $KNN"
+    print_info "  Poisson Reconstruction:"
+    print_info "    - Octree Depth: $OCTREE_DEPTH"
+    print_info "    - Samples per Node: $SAMPLES_PER_NODE"
+    print_info "    - Point Weight: $POINT_WEIGHT"
+    print_info "    - Boundary: Neumann"
+    print_info "    - Threads: $THREADS"
+    print_info "    - Output Density as SF: YES"
+    print_info "    - Interpolate Colors: YES"
     echo ""
 
-    # Process each file
+    # Process files
     local success_count=0
     local fail_count=0
 
@@ -254,6 +323,16 @@ main() {
         print_error "Failed to process: $fail_count file(s)"
     fi
 
+    print_info ""
+    print_info "Output files are in: $(pwd)/$OUTPUT_DIR"
+    print_info "  - [filename].bin : CloudCompare project with point cloud and mesh"
+    print_info ""
+    print_info "The mesh includes a 'Density' scalar field from PoissonRecon."
+    print_info "Open the .bin file in CloudCompare to filter out low-density areas:"
+    print_info "  1. Select mesh > Properties > SF Display > adjust min value"
+    print_info "  2. Edit > Scalar Fields > Filter by Value"
+    print_info "  3. Export the filtered mesh"
+
     return $fail_count
 }
 
@@ -261,29 +340,50 @@ main() {
 # Script Entry Point
 # ============================================================================
 
-# Show usage if -h or --help is passed
 if [[ "$1" == "-h" || "$1" == "--help" ]]; then
     echo "Usage: $0 [INPUT_DIRECTORY]"
     echo ""
-    echo "Process LAS point cloud files with CloudCompare."
+    echo "Process LAS point cloud files with CloudCompare and PoissonRecon."
+    echo "The output mesh includes a density scalar field for manual filtering."
     echo ""
     echo "Arguments:"
     echo "  INPUT_DIRECTORY   Directory containing LAS files (default: current directory)"
     echo ""
     echo "Environment Variables:"
     echo "  CLOUDCOMPARE_PATH   Path to CloudCompare executable"
+    echo "  POISSONRECON_PATH   Path to PoissonRecon executable"
     echo ""
     echo "Output:"
     echo "  Processed files will be saved to INPUT_DIRECTORY/Processed/"
+    echo "  Each .bin file contains the point cloud and mesh with density SF."
     echo ""
-    echo "Processing Steps:"
-    echo "  1. Import LAS file"
-    echo "  2. Compute Normals (Triangulation, MST orientation knn=6)"
-    echo "  3. Convert Normals to Dip/Dip Direction"
-    echo "  4. Poisson Surface Reconstruction (depth=$OCTREE_DEPTH)"
-    echo "  5. Save as .bin project file"
+    echo "Processing Pipeline:"
+    echo "  1. Import LAS file (CloudCompare)"
+    echo "  2. Compute Normals using Octree (radius=AUTO)"
+    echo "  3. Orient Normals using MST (knn=6)"
+    echo "  4. Convert Normals to Dip/Dip Direction"
+    echo "  5. Export as PLY with normals"
+    echo "  6. Poisson Surface Reconstruction (PoissonRecon)"
+    echo "     - Octree depth: 11"
+    echo "     - Samples per node: 1.5"
+    echo "     - Point weight: 2.0"
+    echo "     - Boundary: Neumann"
+    echo "     - Output density as SF: YES"
+    echo "     - Interpolate colors: YES"
+    echo "     - Threads: 16"
+    echo "  7. Save CloudCompare project (.bin) with point cloud and mesh"
+    echo ""
+    echo "Manual Filtering in CloudCompare:"
+    echo "  1. Open the .bin project file"
+    echo "  2. Select the mesh in the DB Tree"
+    echo "  3. In Properties panel, adjust SF Display min value"
+    echo "  4. Use 'Edit > Scalar Fields > Filter by Value' to remove vertices"
+    echo "  5. Export the filtered mesh"
+    echo ""
+    echo "Prerequisites:"
+    echo "  - CloudCompare: https://www.cloudcompare.org/"
+    echo "  - PoissonRecon: https://github.com/mkazhdan/PoissonRecon"
     exit 0
 fi
 
-# Run main function
 main "$@"
