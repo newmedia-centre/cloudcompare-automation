@@ -2,18 +2,20 @@
 
 Batch processing scripts for automating point cloud workflows using **CloudComPy** (Python bindings for CloudCompare). Process LAS files through normal computation, Poisson Surface Reconstruction with color transfer, and save CloudCompare projects for manual mesh filtering.
 
-**Now with a Terminal User Interface (TUI)** built with [Bubble Tea](https://github.com/charmbracelet/bubbletea)!
+**Now with a beautiful Terminal User Interface (TUI)** built with [Bubble Tea](https://github.com/charmbracelet/bubbletea) featuring animated progress indicators and real-time feedback!
 
 ## Features
 
-- **Interactive TUI**: Beautiful terminal interface for configuring and running processing
+- **Interactive TUI**: Beautiful terminal interface with animations for configuring and running processing
+- **Animated Progress**: Step-by-step pipeline visualization with unique spinners for each stage
+- **Real-time Stats**: Watch point counts, mesh faces, and elapsed time update live
 - **Batch Processing**: Automatically process multiple LAS files in a directory
 - **Normal Computation**: Calculate normals using triangulation with MST orientation
 - **DIP/Dip Direction**: Convert normals to scalar fields for geological analysis
 - **Surface Reconstruction**: Poisson Surface Reconstruction with density output
 - **Color Transfer**: Interpolate RGB colors from point cloud to mesh vertices
 - **CloudCompare Projects**: Output `.bin` files ready for filtering and export
-- **Real-time Progress**: Watch processing logs and progress in real-time
+- **Clipboard Support**: Paste paths directly with `Ctrl+V`
 
 ## Requirements
 
@@ -60,21 +62,31 @@ Build and run the interactive terminal interface:
 .\cloudcompare-tui.exe
 ```
 
-The TUI provides:
-- **Welcome Screen**: Overview of the tool
-- **Parameter Configuration**: Configure all processing options with an interactive form
-- **Directory Browser**: Navigate and select input directories
-- **Processing View**: Real-time progress and log output
-- **Results Summary**: Processing statistics and output location
+### TUI Screens
 
-#### TUI Navigation
+#### Welcome Screen
+- Overview of the tool with ASCII art logo
+- Press `Enter` to start
+
+#### Configuration Screen
+- **Input Directory**: Path to folder containing LAS files (supports `Ctrl+V` paste)
+- **Output Directory**: Subdirectory name for output files (default: `Processed`)
+- **KNN**: K-nearest neighbors for MST normal orientation (default: 6)
+- **Octree Depth**: Poisson reconstruction depth (default: 11, range 8-12)
+- **Samples/Node**: Samples per node parameter (default: 1.5)
+- **Point Weight**: Point weight parameter (default: 2.0)
+- **Boundary Type**: 0=Free, 1=Dirichlet, 2=Neumann (default: 2)
+- **Summary Panel**: Shows full paths, quality setting, and LAS file count
+
+### TUI Navigation
 
 | Key | Action |
 |-----|--------|
 | `Tab` / `↓` | Next field |
 | `Shift+Tab` / `↑` | Previous field |
-| `Enter` | Submit / Select |
+| `Enter` | Submit / Select / Start |
 | `b` | Browse for directory |
+| `Ctrl+V` | Paste from clipboard |
 | `Esc` | Go back |
 | `q` | Quit |
 | `Ctrl+C` | Cancel processing |
@@ -135,12 +147,11 @@ Options:
 
 The script performs these steps automatically:
 
-1. **Load LAS file** into CloudComPy
-2. **Compute normals** using triangulation model with MST orientation
-3. **Convert normals** to DIP/Dip Direction scalar fields
-4. **Poisson reconstruction** with density scalar field output
-5. **Transfer colors** from point cloud to mesh vertices
-6. **Save project** as CloudCompare `.bin` file
+1. **[1/5] Load LAS file** into CloudComPy
+2. **[2/5] Compute normals** using triangulation model with MST orientation
+3. **[3/5] Convert normals** to DIP/Dip Direction scalar fields
+4. **[4/5] Poisson reconstruction** with density scalar field output
+5. **[5/5] Save project** as CloudCompare `.bin` file (includes color transfer)
 
 ## Output
 
@@ -177,16 +188,13 @@ The **Density** scalar field indicates reconstruction confidence:
 
 ## Troubleshooting
 
-### "Incorrect Environment" Error
+### "Conda not found" Error
 
-The conda environment is not activated. The `run_cloudcompy.bat` script should handle this automatically, but if issues persist:
+Run the TUI from Anaconda Prompt, or ensure conda is in your PATH.
 
-```batch
-conda activate CloudComPy311
-cd C:\bin\CloudComPy311
-envCloudComPy.bat
-python process_las_files.py
-```
+### "Failed to activate CloudComPy311" Error
+
+The conda environment doesn't exist. Run `setup_cloudcompy.bat` first.
 
 ### "CloudComPy not found" Error
 
@@ -196,6 +204,16 @@ Verify CloudComPy binaries are extracted to `C:\bin\CloudComPy311`. If using a d
 set CLOUDCOMPY_PATH=C:\your\path\to\CloudComPy311
 ```
 
+### "CloudComPy import failed" Error
+
+The environment setup may be incomplete. Try:
+```batch
+conda activate CloudComPy311
+cd C:\bin\CloudComPy311
+envCloudComPy.bat
+python -c "import cloudComPy"
+```
+
 ### "PoissonRecon plugin not available" Error
 
 Ensure you downloaded the full CloudComPy package that includes plugins. The PoissonRecon plugin should be in:
@@ -203,11 +221,13 @@ Ensure you downloaded the full CloudComPy package that includes plugins. The Poi
 C:\bin\CloudComPy311\CloudCompare\plugins\
 ```
 
-### Processing Stuck or Very Slow
+### Processing Takes Very Long
 
-- Reduce octree depth: `--octree-depth 8`
-- Check available RAM (depth 11 needs ~8GB free)
-- "Bad data" warnings indicate points with invalid normals (processing continues)
+The Poisson reconstruction step (Step 4) is computationally intensive:
+- **Depth 8**: 1-5 minutes
+- **Depth 11**: 10-45+ minutes for large files
+
+The animated progress bar shows estimated progress. Reduce octree depth for faster processing.
 
 ### Mesh Has No Colors
 
@@ -237,7 +257,7 @@ cloudcompare-automation/
 │       └── main.go             # TUI entry point
 └── internal/
     ├── tui/
-    │   ├── model.go            # Bubble Tea model
+    │   ├── model.go            # Bubble Tea model & animations
     │   ├── views.go            # Screen rendering
     │   └── styles.go           # Lipgloss styling
     └── processor/
