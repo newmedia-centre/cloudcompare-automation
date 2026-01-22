@@ -3,7 +3,6 @@
 
 # Go build artifacts
 *.exe
-cloudcompare-tui
 go.sum
 
 # IDE
