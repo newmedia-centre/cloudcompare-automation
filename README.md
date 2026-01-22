@@ -2,20 +2,25 @@
 
 Batch processing scripts for automating point cloud workflows using **CloudComPy** (Python bindings for CloudCompare). Process LAS files through normal computation, Poisson Surface Reconstruction with color transfer, and save CloudCompare projects for manual mesh filtering.
 
+**Now with a Terminal User Interface (TUI)** built with [Bubble Tea](https://github.com/charmbracelet/bubbletea)!
+
 ## Features
 
+- **Interactive TUI**: Beautiful terminal interface for configuring and running processing
 - **Batch Processing**: Automatically process multiple LAS files in a directory
 - **Normal Computation**: Calculate normals using triangulation with MST orientation
 - **DIP/Dip Direction**: Convert normals to scalar fields for geological analysis
 - **Surface Reconstruction**: Poisson Surface Reconstruction with density output
 - **Color Transfer**: Interpolate RGB colors from point cloud to mesh vertices
 - **CloudCompare Projects**: Output `.bin` files ready for filtering and export
+- **Real-time Progress**: Watch processing logs and progress in real-time
 
 ## Requirements
 
 - Windows 10 or 11
 - Anaconda or Miniconda
 - CloudComPy binaries (Python 3.11 version)
+- Go 1.21+ (for building the TUI)
 
 ## Installation
 
@@ -46,7 +51,35 @@ python -c "import cloudComPy as cc; print('CloudComPy OK!')"
 
 ## Usage
 
-### Basic Usage
+### TUI Mode (Recommended)
+
+Build and run the interactive terminal interface:
+
+```batch
+.\build.bat
+.\cloudcompare-tui.exe
+```
+
+The TUI provides:
+- **Welcome Screen**: Overview of the tool
+- **Parameter Configuration**: Configure all processing options with an interactive form
+- **Directory Browser**: Navigate and select input directories
+- **Processing View**: Real-time progress and log output
+- **Results Summary**: Processing statistics and output location
+
+#### TUI Navigation
+
+| Key | Action |
+|-----|--------|
+| `Tab` / `↓` | Next field |
+| `Shift+Tab` / `↑` | Previous field |
+| `Enter` | Submit / Select |
+| `b` | Browse for directory |
+| `Esc` | Go back |
+| `q` | Quit |
+| `Ctrl+C` | Cancel processing |
+
+### Command Line Mode
 
 Process all LAS files in the current directory:
 
@@ -193,10 +226,22 @@ For large point clouds:
 
 ```
 cloudcompare-automation/
-├── README.md               # This file
-├── setup_cloudcompy.bat    # Conda environment setup script
-├── run_cloudcompy.bat      # Wrapper to run with correct environment
-└── process_las_files.py    # Main processing script
+├── README.md                   # This file
+├── setup_cloudcompy.bat        # Conda environment setup script
+├── run_cloudcompy.bat          # Wrapper to run with correct environment
+├── process_las_files.py        # Main processing script
+├── build.bat                   # Build script for the TUI
+├── go.mod                      # Go module definition
+├── cmd/
+│   └── cloudcompare-tui/
+│       └── main.go             # TUI entry point
+└── internal/
+    ├── tui/
+    │   ├── model.go            # Bubble Tea model
+    │   ├── views.go            # Screen rendering
+    │   └── styles.go           # Lipgloss styling
+    └── processor/
+        └── processor.go        # Python script integration
 ```
 
 ## License
@@ -208,3 +253,6 @@ MIT License
 - [CloudCompare](https://www.cloudcompare.org/) - 3D point cloud processing software
 - [CloudComPy](https://github.com/CloudCompare/CloudComPy) - Python bindings for CloudCompare
 - [PoissonRecon](https://github.com/mkazhdan/PoissonRecon) - Surface reconstruction algorithm
+- [Bubble Tea](https://github.com/charmbracelet/bubbletea) - TUI framework for Go
+- [Lip Gloss](https://github.com/charmbracelet/lipgloss) - Style definitions for terminal apps
+- [Bubbles](https://github.com/charmbracelet/bubbles) - TUI components

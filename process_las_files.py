@@ -67,7 +67,12 @@ class CloudComPyProcessor:
 
     def _log(self, message: str, level: str = "INFO"):
         if self.verbose:
-            print(f"[{level}] {message}")
+            print(f"[{level}] {message}", flush=True)
+
+    def _log_step(self, step: int, total: int, message: str):
+        """Log a processing step with flush for real-time output."""
+        if self.verbose:
+            print(f"[INFO] [{step}/{total}] {message}", flush=True)
 
     def _init_cloudcompy(self):
         """Initialize CloudComPy and check for PoissonRecon plugin."""
@@ -104,17 +109,15 @@ class CloudComPyProcessor:
         self._log(f"Output: {output_file}")
 
         # Step 1: Load point cloud
-        self._log("")
-        self._log("Step 1: Loading point cloud...")
+        self._log_step(1, 5, "Loading point cloud...")
         cloud = cc.loadPointCloud(str(input_file))
         if cloud is None:
             self._log(f"Failed to load: {input_file}", "ERROR")
             return False
-        self._log(f"Loaded {cloud.size()} points", "SUCCESS")
+        self._log(f"Loaded {cloud.size():,} points", "SUCCESS")
 
         # Step 2: Compute normals
-        self._log("")
-        self._log("Step 2: Computing normals (Triangulation + MST orientation)...")
+        self._log_step(2, 5, "Computing normals (this may take a few minutes)...")
         success = cc.computeNormals(
             [cloud],
             model=cc.LOCAL_MODEL_TYPES.TRI,  # Triangulation
@@ -132,8 +135,7 @@ class CloudComPyProcessor:
         self._log("Normals computed", "SUCCESS")
 
         # Step 3: Convert normals to DIP/Dip Direction
-        self._log("")
-        self._log("Step 3: Converting normals to DIP/Dip Direction scalar fields...")
+        self._log_step(3, 5, "Converting normals to DIP/Dip Direction...")
         success = cloud.convertNormalToDipDirSFs()
         if not success:
             self._log("Failed to convert normals to DIP", "ERROR")
@@ -141,8 +143,11 @@ class CloudComPyProcessor:
         self._log("DIP scalar fields created", "SUCCESS")
 
         # Step 4: Poisson Surface Reconstruction
-        self._log("")
-        self._log("Step 4: Running Poisson Surface Reconstruction...")
+        depth = self.poisson_params.octree_depth
+        self._log_step(4, 5, f"Poisson Reconstruction (depth={depth})...")
+        self._log(
+            f"This step can take 5-30+ minutes depending on point count and depth"
+        )
 
         # Map boundary type to enum
         boundary_map = {
@@ -165,12 +170,11 @@ class CloudComPyProcessor:
         if mesh is None:
             self._log("Failed to create mesh", "ERROR")
             return False
-        self._log(f"Mesh created with {mesh.size()} faces", "SUCCESS")
+        self._log(f"Mesh created with {mesh.size():,} faces", "SUCCESS")
 
         # Step 4b: Transfer colors from source cloud to mesh vertices
         if cloud.hasColors():
-            self._log("")
-            self._log("Step 4b: Interpolating colors from point cloud to mesh...")
+            self._log("Transferring colors to mesh...")
             mesh_cloud = mesh.getAssociatedCloud()
             if mesh_cloud is not None:
                 success = mesh_cloud.interpolateColorsFrom(cloud)
@@ -181,11 +185,10 @@ class CloudComPyProcessor:
             else:
                 self._log("Could not get mesh vertices for color transfer", "WARNING")
         else:
-            self._log("Source cloud has no colors to transfer", "WARNING")
+            self._log("Source cloud has no colors (skipping transfer)")
 
         # Step 5: Save both cloud and mesh to single .bin file
-        self._log("")
-        self._log("Step 5: Saving project file...")
+        self._log_step(5, 5, "Saving project file...")
 
         # Ensure output directory exists
         output_file.parent.mkdir(parents=True, exist_ok=True)
@@ -195,8 +198,6 @@ class CloudComPyProcessor:
             self._log(f"Failed to save: {output_file}", "ERROR")
             return False
         self._log(f"Saved: {output_file.name}", "SUCCESS")
-
-        self._log("")
         self._log(f"Successfully processed: {input_file.name}", "SUCCESS")
         return True
 

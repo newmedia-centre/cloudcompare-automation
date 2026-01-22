@@ -1,2 +1,13 @@
 /Processed
 *.las
+
+# Go build artifacts
+*.exe
+cloudcompare-tui
+go.sum
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
