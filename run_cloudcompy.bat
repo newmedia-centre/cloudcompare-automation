@@ -7,8 +7,7 @@ setlocal EnableDelayedExpansion
 REM Set CloudComPy installation path
 set CLOUDCOMPY_PATH=C:\bin\CloudComPy311
 
-REM Store the script directory and current directory BEFORE any changes
-set "SCRIPT_DIR=%~dp0"
+REM Store the current directory BEFORE any changes
 set "ORIGINAL_DIR=%cd%"
 set "PYTHON_SCRIPT=%~dp0process_las_files.py"
 
