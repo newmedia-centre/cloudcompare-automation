@@ -2,12 +2,12 @@
 
 Batch processing scripts for automating point cloud workflows using **CloudComPy** (Python bindings for CloudCompare). Process LAS files through normal computation, Poisson Surface Reconstruction with color transfer, and save CloudCompare projects for manual mesh filtering.
 
-**Now with a beautiful Terminal User Interface (TUI)** built with [Bubble Tea](https://github.com/charmbracelet/bubbletea) featuring animated progress indicators and real-time feedback!
+Configure the processor by a beautiful Terminal User Interface (TUI) built with [Bubble Tea](https://github.com/charmbracelet/bubbletea) featuring animated progress indicators and real-time feedback.
 
 ## Features
 
 - **Interactive TUI**: Beautiful terminal interface with animations for configuring and running processing
-- **Animated Progress**: Step-by-step pipeline visualization with unique spinners for each stage
+- **Animated Progress**: Step by step pipeline visualization with unique spinners for each stage
 - **Real-time Stats**: Watch point counts, mesh faces, and elapsed time update live
 - **Batch Processing**: Automatically process multiple LAS files in a directory
 - **Normal Computation**: Calculate normals using triangulation with MST orientation
@@ -15,7 +15,6 @@ Batch processing scripts for automating point cloud workflows using **CloudComPy
 - **Surface Reconstruction**: Poisson Surface Reconstruction with density output
 - **Color Transfer**: Interpolate RGB colors from point cloud to mesh vertices
 - **CloudCompare Projects**: Output `.bin` files ready for filtering and export
-- **Clipboard Support**: Paste paths directly with `Ctrl+V`
 
 ## Requirements
 
@@ -69,7 +68,7 @@ Build and run the interactive terminal interface:
 - Press `Enter` to start
 
 #### Configuration Screen
-- **Input Directory**: Path to folder containing LAS files (supports `Ctrl+V` paste)
+- **Input Directory**: Path to folder containing LAS files
 - **Output Directory**: Subdirectory name for output files (default: `Processed`)
 - **KNN**: K-nearest neighbors for MST normal orientation (default: 6)
 - **Octree Depth**: Poisson reconstruction depth (default: 11, range 8-12)
@@ -86,7 +85,6 @@ Build and run the interactive terminal interface:
 | `Shift+Tab` / `↑` | Previous field |
 | `Enter` | Submit / Select / Start |
 | `b` | Browse for directory |
-| `Ctrl+V` | Paste from clipboard |
 | `Esc` | Go back |
 | `q` | Quit |
 | `Ctrl+C` | Cancel processing |
@@ -214,13 +212,6 @@ envCloudComPy.bat
 python -c "import cloudComPy"
 ```
 
-### "PoissonRecon plugin not available" Error
-
-Ensure you downloaded the full CloudComPy package that includes plugins. The PoissonRecon plugin should be in:
-```
-C:\bin\CloudComPy311\CloudCompare\plugins\
-```
-
 ### Processing Takes Very Long
 
 The Poisson reconstruction step (Step 4) is computationally intensive:
@@ -266,7 +257,7 @@ cloudcompare-automation/
 
 ## License
 
-MIT License
+Apache-2.0 License
 
 ## Acknowledgments
 

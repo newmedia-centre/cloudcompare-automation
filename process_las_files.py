@@ -14,8 +14,8 @@ Prerequisites:
 - CloudComPy (Python bindings for CloudCompare)
   https://github.com/CloudCompare/CloudComPy
 
-Author: CloudCompare Automation Script
-License: MIT
+Author: Sharif Bayoumy
+License: Apache-2.0
 """
 
 import argparse
